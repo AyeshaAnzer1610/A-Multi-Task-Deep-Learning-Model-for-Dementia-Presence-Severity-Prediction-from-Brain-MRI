@@ -1,0 +1,58 @@
+# configs/default.yaml
+# All hyperparameters for the Multi-Task EfficientNet-B0 dementia model.
+
+data:
+  zip_path: "archive.zip"
+  extract_dir: "data_dementia"
+  img_size: 224
+  random_state: 42
+
+  # Class labels used from OASIS dataset
+  classes:
+    non_demented:  "Non Demented"
+    very_mild:     "Very mild Dementia"
+    mild:          "Mild Dementia"
+    moderate:      "Moderate Dementia"
+
+training:
+  batch_size: 32
+  epochs: 25
+  lr_head: 3.0e-4
+  lr_backbone: 3.0e-5
+  weight_decay: 1.0e-4
+  freeze_epochs: 5          # Epochs to keep backbone frozen (warm-up)
+  early_stop_patience: 5
+  grad_clip_norm: 1.0
+
+  # Combined loss weights
+  binary_loss_weight: 0.6
+  ordinal_loss_weight: 0.4
+
+  # Combined score weights (for early stopping)
+  combined_auc_weight: 0.6
+  combined_f1_weight: 0.4
+
+model:
+  backbone: "efficientnet_b0"
+  feature_dim: 1280          # EfficientNet-B0 output channels
+  head_hidden_dim: 256
+  dropout: 0.35
+  se_reduction: 8            # Squeeze-and-Excitation bottleneck factor
+
+augmentation:
+  random_horizontal_flip: 0.5
+  rotation_degrees: 12
+  translate: [0.04, 0.04]
+  scale: [0.95, 1.05]
+  brightness: 0.08
+  contrast: 0.08
+
+  # ImageNet normalization
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+output:
+  results_dir: "results"
+  best_auc_checkpoint:  "best_binary_auc.pth"
+  best_f1_checkpoint:   "best_severity_f1.pth"
+  final_checkpoint:     "final_model.pth"
