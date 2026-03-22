@@ -1,6 +1,6 @@
 # Multi-Task EfficientNet-B0 for Dementia Presence and Severity Prediction
 
-**Ayesha Anzer** · Faculty of Engineering and Applied Science · University of Regina, Canada  
+**Ayesha Anzer and Anthony Aighobahi** · CBBC Career College · Nova Scotia, Canada  
 Presented at the *ISG 15th World Conference*, Vancouver, March 2026
 
 ---
