@@ -18,23 +18,8 @@ A single EfficientNet-B0 backbone, pretrained on ImageNet, is fine-tuned end-to-
 
 ## Architecture
 
-```
-T1-weighted Brain MRI (224x224x3)
-        |
-  EfficientNet-B0 Backbone  (pretrained, ImageNet)
-        |
-  AdaptiveAvgPool2d  -->  1280-dim feature vector
-        |
-  Shared Head:
-    Linear(1280 -> 256) + ReLU + Dropout(0.35)
-    SE Block (Squeeze-and-Excitation, 256-dim)
-        |
-   _____|_____________________
-  |           |               |
-Binary Head  Ordinal Head >=1  Ordinal Head >=2
-Linear(256->1) Linear(256->1) Linear(256->1)
-P(Demented)  P(severity>=VeryMild) P(severity>=Mild/Moderate)
-```
+<img width="1376" height="768" alt="image" src="https://github.com/user-attachments/assets/766f026d-9372-42d5-849a-1c91f00eaae6" />
+
 
 **Ordinal Decoding (Inference)**
 
