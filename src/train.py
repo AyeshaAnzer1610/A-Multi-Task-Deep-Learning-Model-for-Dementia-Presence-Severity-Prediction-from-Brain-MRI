@@ -1,171 +1,197 @@
-"""train.py — Training loop with warm-up freeze, dual checkpointing, and early stopping."""
+"""
+src/train.py  —  Two-phase training loop (paper §3.7)
 
-from __future__ import annotations
-
+*** AMP FIX ***
+The model forward pass runs inside autocast (float16 = fast).
+The loss is computed OUTSIDE autocast (float32 = safe for BCE).
+This is the correct pattern for AMP + BCE loss.
+"""
 import os
-from pathlib import Path
-
-import numpy as np
+import time
 import torch
-import torch.optim as optim
-from sklearn.metrics import roc_auc_score
+import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from .evaluate import (
-    aggregate_by_subject,
-    get_predictions,
-    report_severity,
-)
+from src.losses   import MTLoss, compute_pos_weight
+from src.evaluate import (collect_predictions, tune_thresholds,
+                           compute_subject_level_metrics)
 
 
-def build_optimizer(model, lr_head: float, lr_backbone: float, weight_decay: float):
-    """
-    Two-parameter-group AdamW: backbone uses a 10x lower LR than the head
-    to preserve pretrained features during fine-tuning.
-    """
-    return optim.AdamW(
-        [
-            {"params": model.features.parameters(), "lr": lr_backbone},
-            {
-                "params": (
-                    list(model.shared.parameters())
-                    + list(model.head_bin.parameters())
-                    + list(model.head_ge1.parameters())
-                    + list(model.head_ge2.parameters())
-                ),
-                "lr": lr_head,
-            },
-        ],
-        weight_decay=weight_decay,
-    )
+def _head_params(model):
+    return (list(model.projection.parameters()) +
+            list(model.se.parameters()) +
+            list(model.head_binary.parameters()) +
+            list(model.head_ord_ge1.parameters()) +
+            list(model.head_ord_ge2.parameters()))
 
 
-def train(
-    model,
-    train_loader,
-    val_loader,
-    combined_loss,
-    optimizer,
-    *,
-    device: torch.device,
-    epochs: int = 25,
-    freeze_epochs: int = 5,
-    early_stop_patience: int = 5,
-    grad_clip_norm: float = 1.0,
-    combined_auc_weight: float = 0.6,
-    combined_f1_weight: float = 0.4,
-    results_dir: str = "results",
-    best_auc_filename: str = "best_binary_auc.pth",
-    best_f1_filename: str = "best_severity_f1.pth",
-    use_amp: bool = False,
-) -> dict:
-    """
-    Full training loop.
+def train_one_epoch(model, loader, criterion, optimizer,
+                    scaler, device, grad_clip=1.0):
+    model.train()
+    totals = {"total": 0., "binary": 0., "ordinal": 0., "consistency": 0.}
+    n = 0
 
-    Phases
-    ------
-    1. Warm-up (epochs 1 .. freeze_epochs): backbone frozen, head only.
-    2. Fine-tune (epochs freeze_epochs+1 .. epochs): full network, backbone at lower LR.
+    for batch in loader:
+        imgs  = batch["image"].to(device, non_blocking=True)
+        y_bin = batch["binary"].to(device,  non_blocking=True)
+        y_ord = batch["ordinal"].to(device, non_blocking=True)
 
-    Checkpointing
-    -------------
-    - best_binary_auc.pth   saved whenever validation subject-level AUC improves.
-    - best_severity_f1.pth  saved whenever validation severity macro-F1 improves.
+        optimizer.zero_grad(set_to_none=True)
 
-    Early Stopping
-    --------------
-    Monitors ``combined_auc_weight * bin_auc + combined_f1_weight * sev_f1`` on validation.
+        if scaler is not None:
+            # ── AMP: forward in float16 (fast), loss in float32 (safe) ────────
+            with torch.amp.autocast(device_type="cuda"):
+                out = model(imgs)              # float16 activations
 
-    Returns
-    -------
-    dict with keys: best_bin_auc, best_sev_f1, best_combined
-    """
-    os.makedirs(results_dir, exist_ok=True)
-    auc_path = Path(results_dir) / best_auc_filename
-    f1_path  = Path(results_dir) / best_f1_filename
+            # Loss is computed OUTSIDE autocast — always float32
+            # (F.binary_cross_entropy crashes in float16)
+            losses = criterion(out, y_bin, y_ord)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-    best_bin_auc  = -1.0
-    best_sev_f1   = -1.0
-    best_combined = -1.0
-    patience_counter = 0
-
-    model.freeze_backbone()
-    print(f"Backbone frozen for first {freeze_epochs} epochs.")
-
-    for epoch in range(1, epochs + 1):
-
-        # Unfreeze backbone after warm-up
-        if epoch == freeze_epochs + 1:
-            model.unfreeze_backbone()
-            print(f"\nEpoch {epoch}: backbone unfrozen (fine-tuning at LR {optimizer.param_groups[0]['lr']:.1e}).")
-
-        # ------------------------------------------------------------------
-        # Training pass
-        # ------------------------------------------------------------------
-        model.train()
-        epoch_losses = []
-
-        for x, y_bin, ge1, ge2, _y_sev, _sid in train_loader:
-            x    = x.to(device, non_blocking=True)
-            y_bin = y_bin.to(device, non_blocking=True)
-            ge1  = ge1.to(device, non_blocking=True)
-            ge2  = ge2.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                logit_bin, logit_ge1, logit_ge2 = model(x)
-                loss = combined_loss(logit_bin, logit_ge1, logit_ge2, y_bin, ge1, ge2)
-
-            scaler.scale(loss).backward()
+            scaler.scale(losses["total"]).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
+        else:
+            # CPU / non-AMP path
+            out    = model(imgs)
+            losses = criterion(out, y_bin, y_ord)
+            losses["total"].backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
 
-            epoch_losses.append(loss.item())
+        bs = imgs.size(0)
+        for k in totals:
+            totals[k] += losses[k].item() * bs
+        n += bs
 
+    return {k: v / n for k, v in totals.items()}
+
+
+def save_checkpoint(model, optimizer, epoch, thresholds, path):
+    torch.save({
+        "epoch":           epoch,
+        "model_state":     model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "thresholds":      thresholds,
+    }, path)
+
+
+def load_checkpoint(model, path, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    thr  = ckpt.get("thresholds", {"t1": 0.45, "t2": 0.55, "tbin": 0.48})
+    print(f"  Loaded epoch {ckpt['epoch']} | thresholds: {thr}")
+    return thr
+
+
+def train(cfg, model, train_loader, val_loader,
+          train_samples, val_samples, device, results_dir):
+
+    os.makedirs(results_dir, exist_ok=True)
+    use_amp = (device.type == "cuda")
+
+    # Loss
+    criterion = MTLoss(
+        pos_weight         = compute_pos_weight(train_samples),
+        alpha              = cfg["loss_alpha"],
+        consistency_weight = cfg.get("consistency_weight", 0.05),
+    ).to(device)
+
+    # Phase 1: backbone frozen
+    model.freeze_backbone()
+    optimizer = torch.optim.AdamW(
+        _head_params(model),
+        lr=cfg["head_lr"],
+        weight_decay=cfg["weight_decay"],
+    )
+    scaler    = torch.cuda.amp.GradScaler() if use_amp else None
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["max_epochs"])
+
+    best_composite = best_bin_auc = best_sev_f1 = -1.0
+    patience_count = 0
+    t1   = cfg.get("t1",   0.45)
+    t2   = cfg.get("t2",   0.55)
+    tbin = cfg.get("tbin", 0.48)
+    history = {
+        "train_loss": [], "val_bin_auc": [],
+        "val_sev_f1": [], "composite":  [],
+    }
+
+    for epoch in range(1, cfg["max_epochs"] + 1):
+
+        # Switch to Phase 2
+        if epoch == cfg["freeze_epochs"] + 1:
+            print(f"\n[Epoch {epoch}] Switching to Phase 2: full fine-tuning")
+            model.unfreeze_backbone()
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": model.backbone_features.parameters(),
+                     "lr": cfg["backbone_lr"]},
+                    {"params": _head_params(model),
+                     "lr": cfg["head_lr"]},
+                ],
+                weight_decay=cfg["weight_decay"],
+            )
+            scaler    = torch.cuda.amp.GradScaler() if use_amp else None
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=cfg["max_epochs"] - cfg["freeze_epochs"],
+            )
+
+        t0  = time.time()
+        lss = train_one_epoch(
+            model, train_loader, criterion, optimizer,
+            scaler, device, cfg.get("grad_clip_norm", 1.0)
+        )
         scheduler.step()
-        mean_loss = float(np.mean(epoch_losses))
 
-        # ------------------------------------------------------------------
         # Validation
-        # ------------------------------------------------------------------
-        df_val = get_predictions(model, val_loader, device)
-        g = aggregate_by_subject(df_val)
-        val_bin_auc = roc_auc_score(g["y_bin"].to_numpy(), g["p_bin"].to_numpy())
-        _, val_sev_f1 = report_severity(df_val, name=f"VAL Epoch {epoch}")
+        val_preds    = collect_predictions(model, val_loader, device)
+        t1, t2, tbin = tune_thresholds(val_preds, val_samples)
+        sl           = compute_subject_level_metrics(
+                           val_preds, val_samples, t1, t2, tbin)
+        bin_auc      = sl["binary"]["auc"]
+        sev_f1       = sl["severity"]["macro_f1"]
+        composite    = 0.6 * bin_auc + 0.4 * sev_f1
 
-        combined = combined_auc_weight * val_bin_auc + combined_f1_weight * val_sev_f1
+        history["train_loss"].append(lss["total"])
+        history["val_bin_auc"].append(bin_auc)
+        history["val_sev_f1"].append(sev_f1)
+        history["composite"].append(composite)
 
         print(
-            f"\nEpoch {epoch:03d}/{epochs}  |  loss={mean_loss:.4f}  "
-            f"|  val_bin_AUC={val_bin_auc:.4f}  |  val_sev_F1={val_sev_f1:.4f}  "
-            f"|  combined={combined:.4f}"
+            f"Ep {epoch:3d}/{cfg['max_epochs']} | "
+            f"Loss {lss['total']:.4f} "
+            f"(bin {lss['binary']:.4f} ord {lss['ordinal']:.4f}) | "
+            f"BinAUC {bin_auc:.4f}  SevF1 {sev_f1:.4f}  "
+            f"Comp {composite:.4f} | {time.time()-t0:.1f}s"
         )
 
-        # Dual checkpointing
-        if val_bin_auc > best_bin_auc:
-            best_bin_auc = val_bin_auc
-            torch.save(model.state_dict(), auc_path)
-            print(f"  Saved best binary-AUC checkpoint -> {auc_path}  [{best_bin_auc:.4f}]")
+        thr = {"t1": t1, "t2": t2, "tbin": tbin}
 
-        if val_sev_f1 > best_sev_f1:
-            best_sev_f1 = val_sev_f1
-            torch.save(model.state_dict(), f1_path)
-            print(f"  Saved best severity-F1 checkpoint -> {f1_path}  [{best_sev_f1:.4f}]")
+        if bin_auc > best_bin_auc:
+            best_bin_auc = bin_auc
+            save_checkpoint(model, optimizer, epoch, thr,
+                            os.path.join(results_dir, "best_binary_auc.pth"))
+            print(f"  ✓ best_binary_auc.pth  (BinAUC={bin_auc:.4f})")
 
-        # Early stopping on combined score
-        if combined > best_combined:
-            best_combined = combined
-            patience_counter = 0
+        if sev_f1 > best_sev_f1:
+            best_sev_f1 = sev_f1
+            save_checkpoint(model, optimizer, epoch, thr,
+                            os.path.join(results_dir, "best_severity_f1.pth"))
+            print(f"  ✓ best_severity_f1.pth (SevF1={sev_f1:.4f})")
+
+        if composite > best_composite:
+            best_composite = composite
+            patience_count = 0
         else:
-            patience_counter += 1
-            print(f"  No combined improvement. Patience {patience_counter}/{early_stop_patience}")
-            if patience_counter >= early_stop_patience:
-                print("Early stopping triggered.")
+            patience_count += 1
+            if patience_count >= cfg["early_stop_patience"]:
+                print(f"\n  Early stopping at epoch {epoch}.")
                 break
 
-    return {"best_bin_auc": best_bin_auc, "best_sev_f1": best_sev_f1, "best_combined": best_combined}
+    save_checkpoint(model, optimizer, epoch, thr,
+                    os.path.join(results_dir, "final_model.pth"))
+    print(f"\n✓ Training complete. Checkpoints in: {results_dir}/")
+    return history

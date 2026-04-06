@@ -1,91 +1,108 @@
-#!/usr/bin/env python
 """
-scripts/evaluate.py
-Evaluate a saved checkpoint on validation and test sets.
+scripts/evaluate.py  —  Command-line evaluation entry point
 
-Usage
------
+Usage:
     python scripts/evaluate.py --checkpoint results/best_binary_auc.pth
-    python scripts/evaluate.py --checkpoint results/best_binary_auc.pth --config configs/default.yaml
+    python scripts/evaluate.py --checkpoint results/best_binary_auc.pth --gradcam --tsne
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import argparse
-import sys
-from pathlib import Path
+import argparse, yaml, torch
+from sklearn.metrics import confusion_matrix
 
-import torch
-import yaml
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.utils import set_seed, extract_zip, build_dataframe, subject_split
-from src.dataset import build_loaders
-from src.model import ProposedEffNetOrdinal
-from src.evaluate import (
-    get_predictions,
-    tune_binary_threshold,
-    tune_ordinal_thresholds,
-    report_binary,
-    report_severity,
-)
+from src.dataset  import build_dataloaders
+from src.model    import MTCNNDementia
+from src.train    import load_checkpoint
+from src.evaluate import full_evaluation_report
+from src.gradcam  import GradCAM, tsne_feature_plot
+from src.utils    import (set_seed, get_device, plot_roc_curves,
+                          plot_calibration, plot_confusion_matrix)
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint",  required=True)
+    p.add_argument("--config",      default="configs/default.yaml")
+    p.add_argument("--data_root",   default=None)
+    p.add_argument("--results_dir", default="results")
+    p.add_argument("--gradcam",     action="store_true")
+    p.add_argument("--tsne",        action="store_true")
+    p.add_argument("--n_boot",      type=int, default=1000)
+    return p.parse_args()
 
 
-def main(checkpoint: str, cfg: dict) -> None:
-    set_seed(cfg["data"]["random_state"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main():
+    args = parse_args()
 
-    # Data
-    base = extract_zip(cfg["data"]["zip_path"], cfg["data"]["extract_dir"])
-    df   = build_dataframe(base)
-    train_df, val_df, test_df = subject_split(df, cfg["data"]["random_state"])
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    if args.data_root:
+        cfg["data_root"] = args.data_root
 
-    _, val_loader, test_loader = build_loaders(
-        train_df, val_df, test_df,
-        batch_size=cfg["training"]["batch_size"],
-        img_size=cfg["data"]["img_size"],
-        pin_memory=(device.type == "cuda"),
-    )
+    set_seed(cfg["seed"])
+    device = get_device()
 
-    # Model
-    model = ProposedEffNetOrdinal(
-        dropout=cfg["model"]["dropout"],
-        se_reduction=cfg["model"]["se_reduction"],
+    _, val_loader, test_loader, val_samp, test_samp = \
+        build_dataloaders(
+            data_root   = cfg["data_root"],
+            image_size  = cfg["image_size"],
+            batch_size  = cfg["batch_size"],
+            num_workers = cfg.get("num_workers", 2),
+            val_fold    = cfg.get("val_fold", 1),
+            seed        = cfg["seed"],
+        )
+
+    model = MTCNNDementia(
+        dropout      = cfg["dropout"],
+        se_reduction = cfg.get("se_reduction", 8),
+        pretrained   = False,
     ).to(device)
 
-    state = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(state)
-    print(f"Loaded checkpoint: {checkpoint}")
+    thr  = load_checkpoint(model, args.checkpoint, device)
+    t1, t2, tbin = thr["t1"], thr["t2"], thr["tbin"]
 
-    # Tune thresholds on validation
-    df_val  = get_predictions(model, val_loader, device)
-    best_t,          _  = tune_binary_threshold(df_val)
-    best_t1, best_t2, _ = tune_ordinal_thresholds(df_val)
+    rd = args.results_dir
+    os.makedirs(rd, exist_ok=True)
 
-    # Validation report
-    print("\n" + "=" * 50 + "\nVALIDATION\n" + "=" * 50)
-    report_binary(df_val, best_t, name="VAL", subject_level=False)
-    report_binary(df_val, best_t, name="VAL", subject_level=True)
-    report_severity(df_val, best_t1, best_t2, name="VAL")
+    results = full_evaluation_report(
+        model, test_loader, test_samp, device,
+        t1=t1, t2=t2, tbin=tbin, n_boot=args.n_boot,
+    )
 
-    # Test report
-    print("\n" + "=" * 50 + "\nTEST\n" + "=" * 50)
-    df_test = get_predictions(model, test_loader, device)
-    report_binary(df_test, best_t, name="TEST", subject_level=False)
-    report_binary(df_test, best_t, name="TEST", subject_level=True)
-    report_severity(df_test, best_t1, best_t2, name="TEST")
+    sp = results["subject_predictions"]
+    plot_confusion_matrix(
+        confusion_matrix(sp["y_binary"],  sp["yhat_bin"]),
+        ["Non-Dem.", "Demented"],
+        "Binary Detection (Subject-Level)",
+        os.path.join(rd, "cm_binary.png"),
+    )
+    plot_confusion_matrix(
+        confusion_matrix(sp["y_ordinal"], sp["yhat_ord"]),
+        ["Non-Demented", "Very Mild", "Mild/Moderate"],
+        "Severity Staging (Subject-Level)",
+        os.path.join(rd, "cm_severity.png"),
+    )
+    plot_roc_curves(results,  os.path.join(rd, "roc_curves.png"))
+    plot_calibration(results, os.path.join(rd, "calibration.png"))
+
+    if args.gradcam:
+        gc = GradCAM(model)
+        gc.visualize_batch(
+            test_loader, device, n=8,
+            save_dir=os.path.join(rd, "gradcam"),
+            tasks=["binary", "ordinal1", "ordinal2"],
+        )
+        gc.remove_hooks()
+
+    if args.tsne:
+        tsne_feature_plot(
+            model, test_loader, device,
+            save_path=os.path.join(rd, "tsne_features.png"),
+        )
+
+    print(f"\n✓ All outputs saved to: {rd}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate a dementia model checkpoint.")
-    parser.add_argument("--checkpoint", required=True, help="Path to .pth checkpoint file.")
-    parser.add_argument(
-        "--config", default="configs/default.yaml",
-        help="Path to YAML config (default: configs/default.yaml)",
-    )
-    args = parser.parse_args()
-    main(args.checkpoint, load_config(args.config))
+    main()

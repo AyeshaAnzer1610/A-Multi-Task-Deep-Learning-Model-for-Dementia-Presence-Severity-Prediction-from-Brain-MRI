@@ -1,108 +1,111 @@
-"""model.py — Multi-task EfficientNet-B0 with SE block and ordinal output heads."""
-
+"""
+src/model.py  —  MT-CNN Architecture (paper §3.4)
+EfficientNet-B0 + SE block + 3 task heads (binary, ordinal>=1, ordinal>=2)
+"""
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 
 
-# ---------------------------------------------------------------------------
-# Squeeze-and-Excitation block (1-D, applied to feature vectors)
-# ---------------------------------------------------------------------------
-
-class SEBlock1D(nn.Module):
+class SEBlock(nn.Module):
     """
-    Channel-wise Squeeze-and-Excitation recalibration for 1-D feature vectors.
-
-    Args:
-        dim (int):        Input feature dimension.
-        reduction (int):  Bottleneck reduction factor (default 8).
+    Squeeze-and-Excitation on a 1-D feature vector (B, C).
+    Input is already globally pooled — no spatial squeeze needed.
     """
-
-    def __init__(self, dim: int, reduction: int = 8) -> None:
+    def __init__(self, channels, reduction=8):
         super().__init__()
-        hidden = max(8, dim // reduction)
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, dim),
-            nn.Sigmoid(),
-        )
+        mid      = max(channels // reduction, 1)
+        self.fc1 = nn.Linear(channels, mid)
+        self.fc2 = nn.Linear(mid, channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.net(x)
+    def forward(self, x):
+        # x: (B, C)
+        z = F.relu(self.fc1(x))         # (B, C//r)
+        z = torch.sigmoid(self.fc2(z))  # (B, C) — per-channel gates
+        return x * z                    # (B, C) — recalibrated
 
 
-# ---------------------------------------------------------------------------
-# Proposed model
-# ---------------------------------------------------------------------------
-
-class ProposedEffNetOrdinal(nn.Module):
+class MTCNNDementia(nn.Module):
     """
-    Multi-task EfficientNet-B0 model for simultaneous dementia presence
-    detection (binary) and clinical severity staging (3-class ordinal).
+    Multi-Task CNN: binary dementia detection + ordinal severity staging.
 
-    Architecture
-    ------------
-    Backbone : EfficientNet-B0 (pretrained on ImageNet)
-               -> AdaptiveAvgPool2d -> 1280-dim feature vector
-
-    Shared head:
-        Linear(1280 -> 256) + ReLU + Dropout + SEBlock1D(256)
-
-    Task heads (three independent linear layers):
-        head_bin  : P(Demented)          -- binary presence
-        head_ge1  : P(severity >= 1)     -- ordinal: any dementia
-        head_ge2  : P(severity >= 2)     -- ordinal: Mild or Moderate
-
-    All heads output raw logits; sigmoid is applied externally for loss
-    computation or during inference.
+    forward() → dict:
+        binary   : (B,) P(Demented)
+        ordinal1 : (B,) P(severity >= Very Mild)
+        ordinal2 : (B,) P(severity >= Mild/Moderate)  [always <= ordinal1]
+        features : (B, 256) shared features for Grad-CAM / t-SNE
     """
-
-    def __init__(self, dropout: float = 0.35, se_reduction: int = 8) -> None:
+    def __init__(self, dropout=0.35, se_reduction=8,
+                 pretrained=True, feature_dim=256):
         super().__init__()
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        bb      = efficientnet_b0(weights=weights)
 
-        backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
-        self.features = backbone.features
-        self.pool     = nn.AdaptiveAvgPool2d(1)
+        self.backbone_features = bb.features
+        self.avg_pool          = bb.avgpool
 
-        self.shared = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(1280, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            SEBlock1D(256, reduction=se_reduction),
+        self.projection = nn.Sequential(
+            nn.Linear(1280, feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
         )
+        self.se           = SEBlock(channels=feature_dim, reduction=se_reduction)
+        self.head_binary  = nn.Linear(feature_dim, 1)
+        self.head_ord_ge1 = nn.Linear(feature_dim, 1)
+        self.head_ord_ge2 = nn.Linear(feature_dim, 1)
 
-        self.head_bin = nn.Linear(256, 1)   # binary presence
-        self.head_ge1 = nn.Linear(256, 1)   # P(severity >= Very Mild)
-        self.head_ge2 = nn.Linear(256, 1)   # P(severity >= Mild/Moderate)
+        for m in [self.projection[0],
+                  self.head_binary, self.head_ord_ge1, self.head_ord_ge2,
+                  self.se.fc1, self.se.fc2]:
+            nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+            nn.init.zeros_(m.bias)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (B, 3, H, W) input batch of MRI images.
-
-        Returns:
-            Tuple of three (B,) logit tensors:
-                logit_bin, logit_ge1, logit_ge2
-        """
-        x = self.features(x)
-        x = self.pool(x)
-        x = self.shared(x)
-        return (
-            self.head_bin(x).squeeze(1),
-            self.head_ge1(x).squeeze(1),
-            self.head_ge2(x).squeeze(1),
-        )
-
-    def freeze_backbone(self) -> None:
-        """Freeze all backbone parameters (used during warm-up phase)."""
-        for p in self.features.parameters():
+    def freeze_backbone(self):
+        for p in self.backbone_features.parameters():
             p.requires_grad = False
 
-    def unfreeze_backbone(self) -> None:
-        """Unfreeze backbone for full fine-tuning."""
-        for p in self.features.parameters():
+    def unfreeze_backbone(self):
+        for p in self.backbone_features.parameters():
             p.requires_grad = True
+
+    def forward(self, x):
+        feat     = self.backbone_features(x)       # (B,1280,7,7)
+        feat     = self.avg_pool(feat).flatten(1)  # (B,1280)
+        proj     = self.projection(feat)           # (B,256)
+        se       = self.se(proj)                   # (B,256)
+
+        p_binary = torch.sigmoid(self.head_binary(se)).squeeze(1)
+        p_ge1    = torch.sigmoid(self.head_ord_ge1(se)).squeeze(1)
+        p_ge2    = torch.sigmoid(self.head_ord_ge2(se)).squeeze(1)
+
+        # Enforce P(>=2) <= P(>=1)  [paper Eq. 3]
+        p_ge2 = torch.minimum(p_ge2, p_ge1)
+
+        return {"binary": p_binary, "ordinal1": p_ge1,
+                "ordinal2": p_ge2,  "features": se}
+
+    @staticmethod
+    def decode_ordinal(p_ge1, p_ge2, t1=0.45, t2=0.55):
+        pred = torch.zeros_like(p_ge1, dtype=torch.long)
+        pred[p_ge1 >= t1] = 1
+        pred[(p_ge1 >= t1) & (p_ge2 >= t2)] = 2
+        return pred
+
+    def parameter_breakdown(self):
+        parts = {
+            "EfficientNet-B0": sum(p.numel() for p in self.backbone_features.parameters()),
+            "Projection head": sum(p.numel() for p in self.projection.parameters()),
+            "SE Block":        sum(p.numel() for p in self.se.parameters()),
+            "Binary head":     sum(p.numel() for p in self.head_binary.parameters()),
+            "Ord head >=1":    sum(p.numel() for p in self.head_ord_ge1.parameters()),
+            "Ord head >=2":    sum(p.numel() for p in self.head_ord_ge2.parameters()),
+        }
+        total = sum(parts.values())
+        print(f"\n{'Component':<25} {'Params':>10}")
+        print("-" * 37)
+        for k, v in parts.items():
+            print(f"  {k:<23} {v:>10,}")
+        print("-" * 37)
+        print(f"  {'TOTAL':<23} {total:>10,}\n")
+        return parts
